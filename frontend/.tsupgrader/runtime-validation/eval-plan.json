@@ -1,0 +1,64 @@
+{
+  "generatedAt": "2026-10-21T13:27:16+05:30",
+  "generatedOnPlatform": "win32",
+  "projectType": "webapp",
+  "devServer": {
+    "command": "npm",
+    "args": [
+      "run",
+      "dev",
+      "--",
+      "--host",
+      "127.0.0.1",
+      "--port",
+      "5178",
+      "--strictPort"
+    ],
+    "url": "http://127.0.0.1:5178/",
+    "readyTimeoutSeconds": 120
+  },
+  "setup": [],
+  "assertions": [
+    {
+      "name": "frontend-build",
+      "kind": "process",
+      "command": "npm",
+      "args": [
+        "run",
+        "build"
+      ],
+      "verificationMethod": "exit-code",
+      "expected": "0",
+      "timeoutSeconds": 180
+    },
+    {
+      "name": "checklist-helper-tests",
+      "kind": "process",
+      "command": "node",
+      "args": [
+        "--test",
+        "src/taskChecklist.test.js"
+      ],
+      "verificationMethod": "test-results",
+      "expected": "0",
+      "timeoutSeconds": 60
+    },
+    {
+      "name": "backend-tests",
+      "kind": "process",
+      "command": "python",
+      "args": [
+        "-m",
+        "pytest",
+        "-q"
+      ],
+      "cwd": "E:\\EventEase-AI\\backend",
+      "env": {
+        "GEMINI_API_KEY": ""
+      },
+      "verificationMethod": "test-results",
+      "expected": "0",
+      "timeoutSeconds": 180
+    }
+  ]
+}
