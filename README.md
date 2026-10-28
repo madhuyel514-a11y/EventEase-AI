@@ -6,8 +6,8 @@ A responsive celebration-planning app built for PromptWars Virtual 2026, Challen
 
 - Personalized event form: type (including corporate events), date, description, INR budget, guest count, venue, food, dietary, cultural, and accessibility preferences.
 - Event-specific preparation checklists cover ceremony and guest coordination for weddings; cake, invitations and activities for birthdays; and agenda, speakers, AV and attendee coordination for corporate events, with templates for the other supported types.
-- Gemini-generated structured plans through a Python FastAPI backend, when `GEMINI_API_KEY` is configured.
-- Explicit deterministic demo mode when no Gemini key is present. Demo plans are labelled; they are never represented as AI output.
+- Gemini-generated structured plans by default, or optional Groq generation, through a Python FastAPI backend.
+- Explicit deterministic demo mode when the selected provider key is missing or the provider is rate limited or temporarily unavailable. Demo plans are labelled; they are never represented as AI output.
 - BudgetGuard calculates allocation totals and per-guest estimates in Python, flags overspending, and suggests cost-saving changes.
 - Clickable preparation checklist, vendor-category prompts, and a what-if form to regenerate for a changed budget or guest count.
 - Budget Shock Simulator models one category increase, added guests, or fixed expense without modifying the original plan or calling Gemini.
@@ -18,14 +18,14 @@ A responsive celebration-planning app built for PromptWars Virtual 2026, Challen
 ## Architecture
 
 - `frontend/`: React 19 and Vite SPA, with responsive CSS and lucide icons.
-- `backend/app/main.py`: FastAPI routes, Pydantic request/response validation, Gemini integration, demo plan, and BudgetGuard calculations.
+- `backend/app/main.py`: FastAPI routes, Pydantic request/response validation, Gemini and Groq integrations, demo plan, and BudgetGuard calculations.
 - `backend/tests/`: API, validation, and budget calculation tests.
 - `POST /api/plan`: validates an event request and returns an AI or demo plan with server-calculated budget totals.
 - `POST /api/timeline-recovery`: evaluates supplied event/task dates against the current pre-event window and returns advisory deadline suggestions.
 - `POST /api/trade-offs`: returns deterministic budget-safe alternatives based on the submitted current plan.
 - `GET /api/health`: simple backend readiness endpoint.
 
-The Gemini key is read only by the backend from `GEMINI_API_KEY`; it is never included in the frontend bundle. AI plan fields are requested as JSON and revalidated with Pydantic before use.
+`AI_PROVIDER` selects the backend provider and defaults to `gemini`; set it to `groq` to use Groq instead. Provider keys are read only by the backend from `GEMINI_API_KEY` or `GROQ_API_KEY` and are never included in the frontend bundle. Gemini and Groq plans are validated with the existing Pydantic `AIPlan` schema before use. Groq uses strict JSON Schema output with `openai/gpt-oss-20b`.
 
 Budget Shock recovery uses deterministic maximum reductions against each original allocation: decor/decoration/flowers up to 25%, entertainment/music/DJ up to 20%, and favors/favours up to 50%. Categories marked essential, required, or mandatory are excluded. Other categories are not reduced. Recovery reports any remaining shortfall; all scenario amounts are estimates, not vendor quotes.
 
@@ -41,7 +41,7 @@ The Trade-Off Explorer is named for the feature but is not AI-generated and does
 
 - Node.js 20.19+ (or 22.12+), npm
 - Python 3.10+
-- Optional: a Google Gemini API key for AI generation. Without it, the app works in clearly labelled demo mode.
+- Optional: a Google Gemini API key or Groq API key for AI generation. Without the selected provider's key, the app works in clearly labelled demo mode.
 
 ## Run locally
 
@@ -55,7 +55,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 Copy-Item .env.example .env
-# Add your key to backend\.env to enable Gemini; leave it blank for demo mode.
+# Set AI_PROVIDER=gemini or AI_PROVIDER=groq and configure that provider's key; omit both keys for demo mode.
 uvicorn app.main:app --reload
 ```
 
@@ -75,8 +75,11 @@ Open the Vite URL shown in the terminal (normally `http://127.0.0.1:5173`). The 
 
 | Variable | Used by | Description |
 |---|---|---|
-| `GEMINI_API_KEY` | Backend only | Google AI Studio API key; leave empty for deterministic demo mode |
+| `AI_PROVIDER` | Backend only | `gemini` (default) or `groq`; selects the only provider used |
+| `GEMINI_API_KEY` | Backend only | Google AI Studio API key; required when `AI_PROVIDER=gemini` |
 | `GEMINI_MODEL` | Backend | Recommended and live-tested model: `gemini-3.1-flash-lite`; code defaults to `gemini-3.8-flash` if unset |
+| `GROQ_API_KEY` | Backend only | Groq API key; required when `AI_PROVIDER=groq` |
+| `GROQ_MODEL` | Backend | Groq model; defaults to `openai/gpt-oss-20b` (supports strict structured outputs) |
 | `CORS_ORIGINS` | Backend | Comma-separated exact frontend origins; defaults to the two local Vite origins |
 | `VITE_API_URL` | Frontend build/dev | Optional backend base URL; defaults to `http://127.0.0.1:8000` |
 
@@ -103,7 +106,7 @@ npm run build
 
 ## Deployment
 
-Deploy the frontend static output from `frontend/dist` to any static host. Set `VITE_API_URL` to the publicly reachable HTTPS URL of the backend at frontend build time. Deploy the FastAPI application to a Python ASGI host, configure `GEMINI_MODEL=gemini-3.1-flash-lite`, store `GEMINI_API_KEY` as a server-side secret, and run:
+Deploy the frontend static output from `frontend/dist` to any static host. Set `VITE_API_URL` to the publicly reachable HTTPS URL of the backend at frontend build time. Deploy the FastAPI application to a Python ASGI host and set only the selected provider's key as a server-side secret. For Groq, configure `AI_PROVIDER=groq`, `GROQ_MODEL=openai/gpt-oss-20b`, and `GROQ_API_KEY` as a server-side secret; for Gemini, configure `AI_PROVIDER=gemini` and `GEMINI_API_KEY` as a server-side secret. Then run:
 
 ```sh
 uvicorn app.main:app --host 0.0.0.0 --port 8000

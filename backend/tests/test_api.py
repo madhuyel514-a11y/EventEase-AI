@@ -4,6 +4,8 @@ from fastapi.testclient import TestClient
 
 import json
 import logging
+import sys
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -24,6 +26,8 @@ from app.main import (
     _tailor_event_timeline,
     _analyze_timeline_recovery,
     _cors_origins,
+    _generate_with_groq,
+    _strict_ai_plan_schema,
     _simulate_budget_shock,
     _compare_trade_offs,
     app,
@@ -147,7 +151,9 @@ def test_plan_api_returns_explicit_demo_mode_without_key(monkeypatch) -> None:
 
 
 def test_plan_api_preserves_ai_mode_when_gemini_succeeds(monkeypatch) -> None:
+    monkeypatch.delenv("AI_PROVIDER", raising=False)
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
     generated = AIPlan(
         overview="A personalized celebration plan.",
         allocations=[BudgetLine(category="Decor", amount_inr=10000, rationale="A modest decor plan.")],
@@ -177,6 +183,161 @@ def test_plan_api_preserves_ai_mode_when_gemini_succeeds(monkeypatch) -> None:
     assert result["overview"] == generated.overview
     assert "fallback_reason" not in result
     assert result["budget"]["total_estimated_inr"] == 10000
+
+
+def test_groq_generation_uses_official_sdk_and_strict_ai_plan_schema(monkeypatch) -> None:
+    monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
+    monkeypatch.setenv("GROQ_MODEL", "openai/gpt-oss-20b")
+    request = PlanRequest.model_validate(payload())
+    generated_plan = AIPlan(
+        overview="A Groq-generated family celebration.",
+        allocations=[BudgetLine(category="Decor", amount_inr=10000, rationale="A modest decor plan.")],
+        timeline=[
+            {
+                "title": "Confirm the garden layout",
+                "due_date": request.event_date,
+                "detail": "Review seating and step-free routes.",
+            }
+        ],
+        vendor_categories=[{"category": "Catering", "essential": True}],
+    )
+    captured = {}
+
+    class FakeGroq:
+        def __init__(self, *, api_key):
+            captured["api_key"] = api_key
+            self.chat = SimpleNamespace(
+                completions=SimpleNamespace(create=self.create_completion)
+            )
+
+        def create_completion(self, **kwargs):
+            captured["request"] = kwargs
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        message=SimpleNamespace(content=generated_plan.model_dump_json())
+                    )
+                ]
+            )
+
+    monkeypatch.setitem(sys.modules, "groq", SimpleNamespace(Groq=FakeGroq))
+    result = _generate_with_groq(request)
+
+    assert result.overview == generated_plan.overview
+    assert captured["api_key"] == "groq-test-key"
+    assert captured["request"]["model"] == "openai/gpt-oss-20b"
+    response_schema = captured["request"]["response_format"]["json_schema"]
+    assert response_schema["strict"] is True
+    assert response_schema["schema"] == _strict_ai_plan_schema()
+    assert response_schema["schema"]["additionalProperties"] is False
+    assert set(response_schema["schema"]["required"]) == {
+        "overview", "allocations", "timeline", "vendor_categories",
+    }
+
+
+def test_plan_api_selects_groq_when_configured(monkeypatch) -> None:
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
+    generated = AIPlan(
+        overview="A Groq-generated celebration.",
+        allocations=[BudgetLine(category="Decor", amount_inr=10000, rationale="A modest decor plan.")],
+        timeline=[
+            {
+                "title": "Confirm the venue",
+                "due_date": payload()["event_date"],
+                "detail": "Review the event space.",
+            }
+        ],
+        vendor_categories=[{"category": "Catering", "essential": True}],
+    )
+    called = []
+
+    def generate(request):
+        called.append(request)
+        return generated
+
+    monkeypatch.setattr("app.main._generate_with_groq", generate)
+    monkeypatch.setattr(
+        "app.main._generate_with_gemini",
+        lambda _request: pytest.fail("Gemini must not run when Groq is selected."),
+    )
+
+    response = client.post("/api/plan", json=payload())
+
+    assert response.status_code == 200
+    assert response.json()["mode"] == "ai"
+    assert response.json()["overview"] == generated.overview
+    assert len(called) == 1
+
+
+def test_plan_api_returns_labeled_demo_when_selected_groq_key_is_missing(monkeypatch) -> None:
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "app.main._generate_with_groq",
+        lambda _request: pytest.fail("Generation must not run without the selected provider key."),
+    )
+
+    response = client.post("/api/plan", json=payload())
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["mode"] == "demo"
+    assert result["fallback_reason"] == (
+        "No Groq API key is configured. This is a deterministic demo fallback, "
+        "not an AI-generated plan. Configure GROQ_API_KEY to enable AI generation."
+    )
+
+
+def test_plan_api_does_not_expose_groq_auth_error_or_secret(monkeypatch, caplog) -> None:
+    secret_detail = "provider private error and key marker"
+
+    class ProviderAuthError(Exception):
+        status_code = 401
+
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
+    monkeypatch.setattr(
+        "app.main._generate_with_groq",
+        lambda _request: (_ for _ in ()).throw(ProviderAuthError(secret_detail)),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        response = client.post("/api/plan", json=payload())
+
+    assert response.status_code == 502
+    assert "Groq credentials were rejected" in response.json()["detail"]
+    assert secret_detail not in response.text
+    assert "groq-test-key" not in response.text
+    assert secret_detail not in caplog.text
+    assert "groq-test-key" not in caplog.text
+
+
+def test_plan_api_returns_labeled_demo_fallback_for_groq_upstream_error(monkeypatch, caplog) -> None:
+    secret_detail = "private Groq upstream response"
+
+    class ProviderServerError(Exception):
+        status_code = 503
+
+    monkeypatch.setenv("AI_PROVIDER", "groq")
+    monkeypatch.setenv("GROQ_API_KEY", "groq-test-key")
+    monkeypatch.setattr(
+        "app.main._generate_with_groq",
+        lambda _request: (_ for _ in ()).throw(ProviderServerError(secret_detail)),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.main"):
+        response = client.post("/api/plan", json=payload())
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["mode"] == "demo"
+    assert result["fallback_reason"] == (
+        "Groq is temporarily unavailable. This is a deterministic demo fallback, "
+        "not an AI-generated plan. You can retry later."
+    )
+    assert secret_detail not in response.text
+    assert secret_detail not in caplog.text
 
 
 def test_plan_api_returns_labeled_demo_fallback_for_gemini_rate_limit(monkeypatch, caplog) -> None:

@@ -982,6 +982,59 @@ def _parse_gemini_plan(
     return _correct_timeline_dates(plan, event_date, today)
 
 
+def _planning_prompt(request: PlanRequest) -> str:
+    return (
+        "Create a practical celebration plan. All amounts are approximate INR estimates, never vendor quotes. "
+        "Do not claim availability or confirmed bookings. Keep categories distinct and match the user's budget "
+        "and guest count; it is acceptable for estimated allocations to exceed budget so BudgetGuard can flag it. "
+        "Make overview, allocations, and vendor prompts specific to the event and preferences. "
+        "For the timeline, use distinct practical tasks for the selected event type, not generic tasks with "
+        "event-specific wording; the service applies a validated event-specific checklist after generation. "
+        "Use preparation deadlines before the event date, format all due_date values as YYYY-MM-DD, "
+        "and include the user's stated preferences. "
+        f"Event: {request.event_type}. Description: {request.description}. Date: {request.event_date}. "
+        f"Budget INR: {request.budget_inr}. Guests: {request.guest_count}. Venue: {request.venue_preference}. "
+        f"Food preferences: {request.food_preferences}. Dietary preferences: {request.dietary_preferences}. "
+        f"Cultural preferences: {request.cultural_preferences}. Accessibility preferences: {request.accessibility_preferences}."
+    )
+
+
+def _strict_ai_plan_schema() -> dict:
+    schema = AIPlan.model_json_schema()
+    definitions = schema.get("$defs", {})
+
+    def normalize(node: object) -> object:
+        if isinstance(node, list):
+            return [normalize(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        if "$ref" in node:
+            definition_name = node["$ref"].rsplit("/", 1)[-1]
+            return normalize(definitions[definition_name])
+
+        normalized = {
+            key: normalize(node[key])
+            for key in ("type", "enum", "anyOf")
+            if key in node
+        }
+        if "properties" in node:
+            normalized["properties"] = {
+                name: normalize(value)
+                for name, value in node["properties"].items()
+            }
+        if "items" in node:
+            normalized["items"] = normalize(node["items"])
+        if node.get("type") == "object":
+            normalized["required"] = list(normalized.get("properties", {}))
+            normalized["additionalProperties"] = False
+        return normalized
+
+    normalized_schema = normalize(schema)
+    if not isinstance(normalized_schema, dict):
+        raise TypeError("The AI plan schema must be a JSON object.")
+    return normalized_schema
+
+
 def _safe_validation_issues(exc: ValidationError) -> list[dict]:
     known_fields = {
         "overview", "allocations", "category", "amount_inr", "rationale",
@@ -1140,22 +1193,9 @@ def _generate_with_gemini(request: PlanRequest) -> AIPlan:
     from google.genai import types
 
     client = genai.Client(api_key=api_key)
-    prompt = (
-        "Create a practical celebration plan. All amounts are approximate INR estimates, never vendor quotes. "
-        "Do not claim availability or confirmed bookings. Keep categories distinct and match the user's budget "
-        "and guest count; it is acceptable for estimated allocations to exceed budget so BudgetGuard can flag it. "
-        "Make overview, allocations, and vendor prompts specific to the event and preferences. "
-        "For the timeline, use distinct practical tasks for the selected event type, not generic tasks with "
-        "event-specific wording; the service applies a validated event-specific checklist after generation. "
-        "Use preparation deadlines before the event date and include the user's stated preferences. "
-        f"Event: {request.event_type}. Description: {request.description}. Date: {request.event_date}. "
-        f"Budget INR: {request.budget_inr}. Guests: {request.guest_count}. Venue: {request.venue_preference}. "
-        f"Food preferences: {request.food_preferences}. Dietary preferences: {request.dietary_preferences}. "
-        f"Cultural preferences: {request.cultural_preferences}. Accessibility preferences: {request.accessibility_preferences}."
-    )
     response = client.models.generate_content(
         model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
-        contents=prompt,
+        contents=_planning_prompt(request),
         config=types.GenerateContentConfig(
             response_mime_type="application/json",
             response_schema=AIPlan,
@@ -1165,6 +1205,40 @@ def _generate_with_gemini(request: PlanRequest) -> AIPlan:
     return _parse_gemini_plan(response.parsed, response.text, request.event_date)
 
 
+def _generate_with_groq(request: PlanRequest) -> AIPlan:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Groq API key is not configured.")
+
+    from groq import Groq
+
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"),
+        messages=[
+            {
+                "role": "system",
+                "content": "Generate a practical event plan. Return only data matching the supplied JSON schema.",
+            },
+            {"role": "user", "content": _planning_prompt(request)},
+        ],
+        response_format={
+            "type": "json_schema",
+            "json_schema": {
+                "name": "event_plan",
+                "strict": True,
+                "schema": _strict_ai_plan_schema(),
+            },
+        },
+        temperature=0.4,
+    )
+    content = response.choices[0].message.content
+    if not content:
+        raise ValueError("Groq returned an empty plan.")
+    plan = AIPlan.model_validate_json(content)
+    return _correct_timeline_dates(plan, request.event_date)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -1172,50 +1246,84 @@ def health() -> dict[str, str]:
 
 @app.post("/api/plan")
 def create_plan(request: PlanRequest) -> dict:
-    if os.getenv("GEMINI_API_KEY", "").strip():
-        try:
-            plan = _tailor_event_timeline(request, _generate_with_gemini(request))
-            return _make_result(request, plan, "ai")
-        except ValidationError as exc:
-            logger.warning("Gemini plan validation failed: %s", _safe_validation_issues(exc))
-            raise HTTPException(status_code=502, detail="Gemini returned a plan that could not be validated. Please try again.") from exc
-        except json.JSONDecodeError as exc:
-            logger.warning("Gemini returned invalid JSON (line=%d, column=%d).", exc.lineno, exc.colno)
-            raise HTTPException(status_code=502, detail="Gemini returned a malformed plan. Please try again.") from exc
-        except Exception as exc:
-            message = str(exc).lower()
-            status_code = getattr(exc, "status_code", getattr(exc, "code", None))
-            if status_code == 429 or "429" in message or "rate" in message or "resource_exhausted" in message:
-                logger.warning("Gemini generation was rate limited (error_type=%s).", type(exc).__name__)
-                result = _make_result(request, _demo_plan(request), "demo")
-                result["fallback_reason"] = (
-                    "Gemini is rate limited. This is a deterministic demo fallback, not an AI-generated plan. "
-                    "You can retry later."
-                )
-                return result
-            if status_code == 404:
-                logger.warning("Configured Gemini model is unavailable (provider_status=404).")
-                raise HTTPException(status_code=502, detail="The configured Gemini model is unavailable. Check GEMINI_MODEL and API access.") from exc
-            if status_code in {401, 403}:
-                logger.warning("Gemini credentials or permissions were rejected (provider_status=%s).", status_code)
-                raise HTTPException(status_code=502, detail="Gemini credentials were rejected or lack access. Check backend configuration.") from exc
-            if status_code in {500, 502, 503, 504}:
-                logger.warning(
-                    "Gemini service returned an upstream error (error_type=%s, provider_code=%s).",
-                    type(exc).__name__,
-                    status_code,
-                )
-                result = _make_result(request, _demo_plan(request), "demo")
-                result["fallback_reason"] = (
-                    "Gemini is temporarily unavailable. This is a deterministic demo fallback, "
-                    "not an AI-generated plan. You can retry later."
-                )
-                return result
-            safe_code = status_code if isinstance(status_code, int) else "unknown"
-            logger.warning("Gemini generation failed (error_type=%s, provider_code=%s).", type(exc).__name__, safe_code)
-            raise HTTPException(status_code=502, detail="Gemini could not be reached. Check your connection or try again later.") from exc
+    provider = os.getenv("AI_PROVIDER", "gemini").strip().lower()
+    provider_config = {
+        "gemini": ("Gemini", "GEMINI_API_KEY", _generate_with_gemini),
+        "groq": ("Groq", "GROQ_API_KEY", _generate_with_groq),
+    }
+    if provider not in provider_config:
+        raise HTTPException(status_code=500, detail="AI_PROVIDER must be either 'gemini' or 'groq'.")
 
-    return _make_result(request, _demo_plan(request), "demo")
+    provider_name, api_key_name, generate = provider_config[provider]
+    if not os.getenv(api_key_name, "").strip():
+        result = _make_result(request, _demo_plan(request), "demo")
+        result["fallback_reason"] = (
+            f"No {provider_name} API key is configured. This is a deterministic demo fallback, "
+            f"not an AI-generated plan. Configure {api_key_name} to enable AI generation."
+        )
+        return result
+
+    try:
+        plan = _tailor_event_timeline(request, generate(request))
+        return _make_result(request, plan, "ai")
+    except ValidationError as exc:
+        logger.warning("%s plan validation failed: %s", provider_name, _safe_validation_issues(exc))
+        raise HTTPException(
+            status_code=502,
+            detail=f"{provider_name} returned a plan that could not be validated. Please try again.",
+        ) from exc
+    except json.JSONDecodeError as exc:
+        logger.warning("%s returned invalid JSON (line=%d, column=%d).", provider_name, exc.lineno, exc.colno)
+        raise HTTPException(
+            status_code=502,
+            detail=f"{provider_name} returned a malformed plan. Please try again.",
+        ) from exc
+    except Exception as exc:
+        status_code = getattr(exc, "status_code", getattr(exc, "code", None))
+        if status_code == 429:
+            logger.warning("%s generation was rate limited (error_type=%s).", provider_name, type(exc).__name__)
+            result = _make_result(request, _demo_plan(request), "demo")
+            result["fallback_reason"] = (
+                f"{provider_name} is rate limited. This is a deterministic demo fallback, "
+                "not an AI-generated plan. You can retry later."
+            )
+            return result
+        if status_code == 404:
+            logger.warning("Configured %s model is unavailable (provider_status=404).", provider_name)
+            raise HTTPException(
+                status_code=502,
+                detail=f"The configured {provider_name} model is unavailable. Check {provider.upper()}_MODEL and API access.",
+            ) from exc
+        if status_code in {401, 403}:
+            logger.warning("%s credentials or permissions were rejected (provider_status=%s).", provider_name, status_code)
+            raise HTTPException(
+                status_code=502,
+                detail=f"{provider_name} credentials were rejected or lack access. Check backend configuration.",
+            ) from exc
+        if status_code in {500, 502, 503, 504}:
+            logger.warning(
+                "%s service returned an upstream error (error_type=%s, provider_code=%s).",
+                provider_name,
+                type(exc).__name__,
+                status_code,
+            )
+            result = _make_result(request, _demo_plan(request), "demo")
+            result["fallback_reason"] = (
+                f"{provider_name} is temporarily unavailable. This is a deterministic demo fallback, "
+                "not an AI-generated plan. You can retry later."
+            )
+            return result
+        safe_code = status_code if isinstance(status_code, int) else "unknown"
+        logger.warning(
+            "%s generation failed (error_type=%s, provider_code=%s).",
+            provider_name,
+            type(exc).__name__,
+            safe_code,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"{provider_name} could not be reached. Check your connection or try again later.",
+        ) from exc
 
 
 @app.post("/api/budget-shock", response_model=BudgetShockResult)
